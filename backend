@@ -1,0 +1,418 @@
+```from fastapi import FastAPI, APIRouter, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, FileResponse
+from dotenv import load_dotenv
+import aiosqlite
+import os
+import logging
+import uuid
+import cv2
+import numpy as np
+import tempfile
+import shutil
+import json
+from pathlib import Path
+from pydantic import BaseModel, Field, ConfigDict
+from typing import List, Dict
+from datetime import datetime, timezone
+import asyncio
+from PIL import Image
+import google.generativeai as genai 
+
+# -----------------------------
+# Load environment variables
+# -----------------------------
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / ".env")
+
+# -----------------------------
+# -----------------------------
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("EMERGENT_LLM_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("❌ Missing key in .env file")
+genai.configure(api_key=GEMINI_API_KEY)
+MODEL_NAME = "models/gemini-2.0-flash"
+
+# -----------------------------
+# Database path
+# -----------------------------
+DATABASE_PATH = ROOT_DIR / "driveguard.db"
+
+# -----------------------------
+# FastAPI setup
+# -----------------------------
+app = FastAPI(title="Distracted Driver Detection API")
+api_router = APIRouter(prefix="/api")
+
+# -----------------------------
+# Middleware (CORS)
+# -----------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -----------------------------
+# Detection categories
+# -----------------------------
+DETECTION_CATEGORIES = [
+    "using_phone",
+    "talking_on_call",
+    "talking_to_passenger",
+    "eating_drinking",
+    "looking_away",
+    "drowsiness",
+    "adjusting_controls",
+    "texting",
+    "reaching_for_object",
+    "normal_driving"
+]
+
+# -----------------------------
+# Pydantic models
+# -----------------------------
+class DetectionResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp: float
+    category: str
+    confidence: float
+    description: str
+    frame_time: str
+
+class VideoAnalysisResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    video_filename: str
+    total_duration: float
+    analysis_timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    detections: List[DetectionResult]
+    summary: Dict[str, int]
+    processed_frames: int
+
+class VideoUploadResponse(BaseModel):
+    video_id: str
+    message: str
+    filename: str
+
+# -----------------------------
+# Database initialization
+# -----------------------------
+async def init_database():
+    """Initialize SQLite database with required tables"""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS videos (
+                video_id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                upload_timestamp TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'uploaded',
+                analysis_id TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS analyses (
+                id TEXT PRIMARY KEY,
+                video_id TEXT NOT NULL,
+                video_filename TEXT NOT NULL,
+                total_duration REAL NOT NULL,
+                analysis_timestamp TEXT NOT NULL,
+                processed_frames INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                detections TEXT NOT NULL,
+                FOREIGN KEY (video_id) REFERENCES videos (video_id)
+            )
+        """)
+        await db.commit()
+
+# -----------------------------
+# Helper functions
+# -----------------------------
+def format_time(seconds: float) -> str:
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    seconds = int(seconds % 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+def extract_frames(video_path: str, fps: float = 1.0) -> List[tuple]:
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    if not cap.isOpened():
+        raise HTTPException(status_code=400, detail="Could not open video file")
+
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_interval = max(1, int(video_fps / fps))
+    frame_count = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_count % frame_interval == 0:
+            timestamp = frame_count / video_fps
+            frames.append((frame, timestamp))
+        frame_count += 1
+
+    cap.release()
+    return frames
+
+async def analyze_frame_with_gemini(frame: np.ndarray, timestamp: float) -> DetectionResult:
+    """Analyze a single frame."""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_file:
+            cv2.imwrite(tmp_file.name, frame)
+            temp_path = tmp_file.name
+
+        model = genai.GenerativeModel(MODEL_NAME)
+
+        prompt = """
+        You are an expert in analyzing driver behavior for distracted driving detection.
+        Analyze the uploaded driver image and classify it into one of these categories:
+
+        - using_phone
+        - talking_on_call
+        - talking_to_passenger
+        - eating_drinking
+        - looking_away
+        - drowsiness
+        - adjusting_controls
+        - texting
+        - reaching_for_object
+        - normal_driving
+
+        Respond ONLY with JSON in this exact format:
+        {
+            "category": "one_of_the_categories_above",
+            "confidence": 0.85,
+            "description": "Brief description of visual indicators observed"
+        }
+        """
+
+        with open(temp_path, "rb") as img_file:
+            img_bytes = img_file.read()
+
+        response = model.generate_content([
+            prompt,
+            {"mime_type": "image/jpeg", "data": img_bytes}
+        ])
+
+        os.unlink(temp_path)
+
+        response_text = response.text.strip() if hasattr(response, "text") else "{}"
+        if response_text.startswith("```json"):
+            response_text = response_text.replace("```json", "").replace("```", "").strip()
+        elif response_text.startswith("```"):
+            response_text = response_text.replace("```", "").strip()
+
+        try:
+            result = json.loads(response_text)
+        except json.JSONDecodeError:
+            result = {
+                "category": "normal_driving",
+                "confidence": 0.5,
+                "description": "No clear distraction detected"
+            }
+
+        return DetectionResult(
+            timestamp=timestamp,
+            category=result.get("category", "normal_driving"),
+            confidence=float(result.get("confidence", 0.5)),
+            description=result.get("description", "No clear distraction detected"),
+            frame_time=format_time(timestamp)
+        )
+
+    except Exception as e:
+        logging.error(f"frame analysis failed: {e}")
+        return DetectionResult(
+            timestamp=timestamp,
+            category="normal_driving",
+            confidence=0.3,
+            description="Analysis error - assuming normal driving",
+            frame_time=format_time(timestamp)
+        )
+
+# -----------------------------
+# API Routes
+# -----------------------------
+@api_router.get("/")
+async def root():
+    return {"message": "Distracted Driver Detection API", "status": "active"}
+
+@api_router.get("/model-info")
+async def get_model_info():
+    """Dummy model info endpoint"""
+    return {
+        "model_info": "Gemini-based distracted driver analysis",
+        "framework": "Google Generative AI",
+        "version": MODEL_NAME,
+        "categories": DETECTION_CATEGORIES
+    }
+
+@api_router.post("/upload-video", response_model=VideoUploadResponse)
+async def upload_video(file: UploadFile = File(...)):
+    allowed_extensions = [".mp4", ".avi", ".mov", ".gif"]
+    file_extension = Path(file.filename).suffix.lower()
+    if file_extension not in allowed_extensions:
+        raise HTTPException(status_code=400, detail="Unsupported file type")
+
+    video_id = str(uuid.uuid4())
+
+    # ✅ Cross-platform upload folder (works on Windows, macOS, Linux)
+    upload_dir = ROOT_DIR / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    temp_file_path = upload_dir / f"{video_id}{file_extension}"
+    with open(temp_file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+            INSERT INTO videos (video_id, filename, content_type, file_path, upload_timestamp, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            video_id, file.filename, file.content_type,
+            str(temp_file_path), datetime.now(timezone.utc).isoformat(), "uploaded"
+        ))
+        await db.commit()
+
+    return VideoUploadResponse(
+        video_id=video_id,
+        message="Video uploaded successfully",
+        filename=file.filename
+    )
+
+
+@api_router.post("/analyze-video/{video_id}", response_model=VideoAnalysisResult)
+async def analyze_video(video_id: str):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        async with db.execute("SELECT * FROM videos WHERE video_id = ?", (video_id,)) as cursor:
+            video_row = await cursor.fetchone()
+
+    if not video_row:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    columns = ['video_id', 'filename', 'content_type', 'file_path', 'upload_timestamp', 'status', 'analysis_id']
+    video_doc = dict(zip(columns, video_row))
+    video_path = video_doc["file_path"]
+
+    frames = extract_frames(video_path, fps=0.5)
+    if not frames:
+        raise HTTPException(status_code=400, detail="Could not extract frames from video")
+
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    duration = frame_count / fps if fps > 0 else 0
+    cap.release()
+
+    detections = []
+    for frame, timestamp in frames:
+        detection = await analyze_frame_with_gemini(frame, timestamp)
+        detections.append(detection)
+        await asyncio.sleep(0.1)
+
+    summary = {category: 0 for category in DETECTION_CATEGORIES}
+    for detection in detections:
+        if detection.category in summary:
+            summary[detection.category] += 1
+
+    analysis_result = VideoAnalysisResult(
+        video_filename=video_doc["filename"],
+        total_duration=duration,
+        detections=detections,
+        summary=summary,
+        processed_frames=len(frames)
+    )
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        detections_json = json.dumps([d.model_dump() for d in detections])
+        summary_json = json.dumps(summary)
+
+        await db.execute("""
+            INSERT INTO analyses (id, video_id, video_filename, total_duration, analysis_timestamp,
+                                  processed_frames, summary, detections)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            analysis_result.id, video_id, analysis_result.video_filename,
+            analysis_result.total_duration, analysis_result.analysis_timestamp.isoformat(),
+            analysis_result.processed_frames, summary_json, detections_json
+        ))
+
+        await db.execute("""
+            UPDATE videos SET status = ?, analysis_id = ? WHERE video_id = ?
+        """, ("analyzed", analysis_result.id, video_id))
+
+        await db.commit()
+
+    return analysis_result
+
+@api_router.get("/analysis/{analysis_id}", response_model=VideoAnalysisResult)
+async def get_analysis(analysis_id: str):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        async with db.execute("SELECT * FROM analyses WHERE id = ?", (analysis_id,)) as cursor:
+            analysis_row = await cursor.fetchone()
+
+    if not analysis_row:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+
+    columns = ['id', 'video_id', 'video_filename', 'total_duration', 'analysis_timestamp',
+               'processed_frames', 'summary', 'detections']
+    analysis_doc = dict(zip(columns, analysis_row))
+
+    summary = json.loads(analysis_doc['summary'])
+    detections_data = json.loads(analysis_doc['detections'])
+    detections = [DetectionResult(**d) for d in detections_data]
+    analysis_timestamp = datetime.fromisoformat(analysis_doc['analysis_timestamp'])
+
+    return VideoAnalysisResult(
+        id=analysis_doc['id'],
+        video_filename=analysis_doc['video_filename'],
+        total_duration=analysis_doc['total_duration'],
+        analysis_timestamp=analysis_timestamp,
+        detections=detections,
+        summary=summary,
+        processed_frames=analysis_doc['processed_frames']
+    )
+
+@api_router.get("/video/{video_id}/file")
+async def get_video_file(video_id: str):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        async with db.execute("SELECT * FROM videos WHERE video_id = ?", (video_id,)) as cursor:
+            video_row = await cursor.fetchone()
+
+    if not video_row:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    columns = ['video_id', 'filename', 'content_type', 'file_path', 'upload_timestamp', 'status', 'analysis_id']
+    video_doc = dict(zip(columns, video_row))
+
+    return FileResponse(
+        path=video_doc["file_path"],
+        media_type=video_doc["content_type"],
+        filename=video_doc["filename"]
+    )
+
+# -----------------------------
+# Startup & logging
+# -----------------------------
+app.include_router(api_router)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+@app.on_event("startup")
+async def startup_db():
+    await init_database()
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
+```
